@@ -3,18 +3,19 @@
 {% block content %}
 <div class="card">
     <div class="stage-badge">Stage {{ stage }}</div>
-    <h1 class="section-title">Skeleton</h1>
+    <h1 class="section-title">Server-proxy hello world</h1>
     <p>
-        This is the lambda-hw learning project. Stage 0 is just the Flask shim
-        registered behind the gateway — no AWS Lambda calls yet.
-    </p>
-    <p>
-        If you're seeing this page through <code>apps.ksastry.com/app/lambda-hw/</code>,
-        the gateway is wired up correctly: nginx routed the request, the auth service
-        approved your session, and the <code>X-User-*</code> headers reached this app.
+        Click the button below. Flask SigV4-signs a POST to the Lambda
+        Function URL using credentials from the EC2 instance profile,
+        Lambda runs, and the JSON response shows up here.
     </p>
 
-    <h2 class="section-title">Headers received</h2>
+    <button class="btn btn-primary" id="hello-btn" onclick="callHello()">
+        Call Lambda
+    </button>
+    <pre id="hello-result" class="hello-result">(not yet called)</pre>
+
+    <h2 class="section-title">Headers received from the gateway</h2>
     <table class="data-table">
         <tbody>
             <tr><th>user_id</th><td><code>{{ user.user_id }}</code></td></tr>
@@ -26,10 +27,34 @@
 
     <h2 class="section-title">What's next</h2>
     <p>
-        Stage 1 will add the first Lambda — a server-proxy hello-world. Flask gets a
-        new route that signs a SigV4 request to a Lambda Function URL and returns
-        the response. See <code>docs/decisions/</code> for the running record of
-        choices made and tradeoffs considered.
+        Stage 2 will add an API Gateway in front of the same Lambda, with a
+        JWT authorizer so the browser can call it directly (no Flask in the
+        request path). See <code>docs/decisions/</code> for the running
+        record of choices.
     </p>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function callHello() {
+    const btn = document.getElementById('hello-btn');
+    const out = document.getElementById('hello-result');
+    btn.disabled = true;
+    out.textContent = 'calling...';
+    const t0 = performance.now();
+    try {
+        const resp = await fetch('api/hello');
+        const data = await resp.json();
+        const elapsed = (performance.now() - t0).toFixed(0);
+        out.textContent =
+            `// round-trip ${elapsed}ms (browser → Flask → Lambda → back)\n` +
+            JSON.stringify(data, null, 2);
+    } catch (e) {
+        out.textContent = 'Error: ' + e;
+    } finally {
+        btn.disabled = false;
+    }
+}
+</script>
 {% endblock %}

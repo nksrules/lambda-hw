@@ -22,3 +22,17 @@
     font-size: 0.9rem;
     color: var(--text);
 }
+
+.hello-result {
+    margin-top: 1rem;
+    padding: 1rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-x: auto;
+    min-height: 4rem;
+}
