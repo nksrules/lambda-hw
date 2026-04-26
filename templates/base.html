@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {% if standalone %}
+    <base href="/">
+    <title>{% block title %}lambda-hw{% endblock %}</title>
+    <link rel="stylesheet" href="static/anthropic-theme.css">
+    <link rel="stylesheet" href="static/gateway.css">
+    {% else %}
+    <base href="/app/lambda-hw/">
+    <title>{% block title_gateway %}lambda-hw{% endblock %} — Sastry Apps</title>
+    <link rel="stylesheet" href="/static/anthropic-theme.css">
+    <link rel="stylesheet" href="/static/gateway.css">
+    {% endif %}
+    <link rel="stylesheet" href="static/lambda-hw.css">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <div class="container">
+        {% if not standalone %}
+        <nav class="global-nav">
+            <a href="/">Home</a>
+            {% if user.role == 'admin' %}
+            <a href="/admin/">Admin</a>
+            {% endif %}
+            <a href="/auth/account">Account</a>
+            <span class="nav-user">{{ user.display_name }}</span>
+            <button onclick="logout()" class="btn btn-sm btn-outline">Sign Out</button>
+        </nav>
+        {% endif %}
+        <nav class="app-nav">
+            <a href="{{ '/' if standalone else '/app/lambda-hw/' }}" class="app-nav-brand">lambda-hw</a>
+            <div class="app-nav-links">
+                {% block nav %}{% endblock %}
+            </div>
+        </nav>
+
+        {% block content %}{% endblock %}
+    </div>
+
+    {% if not standalone %}
+    <script>
+    function logout() {
+        const csrf = document.cookie.split('; ')
+            .find(r => r.startsWith('csrf_token='))?.split('=')[1] || '';
+        fetch('/auth/logout', {
+            method: 'POST',
+            headers: {'X-CSRF-Token': csrf},
+        }).then(() => { window.location.href = '/auth/login'; });
+    }
+    </script>
+    {% endif %}
+    {% block scripts %}{% endblock %}
+</body>
+</html>
