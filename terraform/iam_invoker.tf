@@ -43,10 +43,18 @@ resource "aws_iam_role_policy" "invoke_lambda_hw" {
 # uses Principal "*" with the lambda:FunctionUrlAuthType=AWS_IAM condition,
 # letting the IAM identity policy do the actual restriction. (Naming a
 # specific role principal here was observed not to authorize at runtime.)
+#
+# source_account adds an aws:SourceAccount condition restricting invocations
+# to principals in our own account. Without this, the resource policy is
+# technically open cross-account (gated only by whether some other account's
+# IAM admin grants InvokeFunctionUrl on our ARN). With it: this account only.
 resource "aws_lambda_permission" "hello_url_invoke" {
-  statement_id           = "AllowAnyIAMPrincipal"
+  statement_id           = "AllowAnyIAMPrincipalInThisAccount"
   action                 = "lambda:InvokeFunctionUrl"
   function_name          = aws_lambda_function.hello.function_name
   principal              = "*"
+  source_account         = data.aws_caller_identity.current.account_id
   function_url_auth_type = "AWS_IAM"
 }
+
+data "aws_caller_identity" "current" {}
