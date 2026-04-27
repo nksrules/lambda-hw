@@ -1,0 +1,19 @@
+# Terraform working files
+.terraform/
+build/
+
+# State and overrides — should never live in git
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Crash logs
+crash.log
+crash.*.log
+
+# .terraform.lock.hcl is intentionally NOT ignored — pin it in git.

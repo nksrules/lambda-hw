@@ -44,16 +44,23 @@ def get_user():
     }
 
 
-def call_lambda_hello(username: str) -> dict:
+def call_lambda_hello(username: str, display_name: str) -> dict:
     """SigV4-sign a POST to the hello Lambda Function URL and return its JSON.
 
     The body is signed *and* sent — SigV4 hashes the body into the signature,
     so what we sign and what we send must be byte-identical.
+
+    We forward BOTH username and display_name. The Lambda only uses
+    display_name for the greeting today, but later stages will use username
+    as a stable identifier for per-user authorization / data scoping.
     """
     if not LAMBDA_HELLO_URL:
         raise RuntimeError("LAMBDA_HELLO_URL env var is not set")
 
-    body = json.dumps({"username": username})
+    body = json.dumps({
+        "username": username,
+        "display_name": display_name,
+    })
 
     aws_req = AWSRequest(
         method="POST",
@@ -90,7 +97,7 @@ def api_hello():
     """Round-trip a request through the Lambda Function URL."""
     user = get_user()
     try:
-        result = call_lambda_hello(user["username"])
+        result = call_lambda_hello(user["username"], user["display_name"])
         log.info("lambda hello round-tripped for %s", user["username"])
         return jsonify(result)
     except Exception as e:
