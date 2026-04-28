@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 STANDALONE = os.environ.get("STANDALONE", "").lower() in ("1", "true", "yes")
 LAMBDA_HELLO_URL = os.environ.get("LAMBDA_HELLO_URL")
+API_GATEWAY_URL = os.environ.get("API_GATEWAY_URL")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # One boto3 session per process. Credentials are looked up lazily through
@@ -89,7 +90,13 @@ def call_lambda_hello(username: str, display_name: str) -> dict:
 def index():
     user = get_user()
     log.info("lambda-hw index viewed by %s", user["username"])
-    return render_template("index.html", user=user, standalone=STANDALONE, stage=1)
+    return render_template(
+        "index.html",
+        user=user,
+        standalone=STANDALONE,
+        stage=2,
+        api_gateway_url=API_GATEWAY_URL or "",
+    )
 
 
 @app.route("/api/hello")
