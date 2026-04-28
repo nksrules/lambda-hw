@@ -17,3 +17,8 @@ output "log_group" {
   description = "CloudWatch log group where the Lambda's stdout/stderr lands."
   value       = "/aws/lambda/${aws_lambda_function.hello.function_name}"
 }
+
+output "api_gateway_url" {
+  description = "Stage 2 browser-direct invoke URL (JWT-authed via API Gateway)."
+  value       = "${aws_apigatewayv2_stage.default.invoke_url}/hello"
+}

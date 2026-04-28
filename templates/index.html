@@ -3,17 +3,53 @@
 {% block content %}
 <div class="card">
     <div class="stage-badge">Stage {{ stage }}</div>
-    <h1 class="section-title">Server-proxy hello world</h1>
+    <h1 class="section-title">Two ways to call the same Lambda</h1>
     <p>
-        Click the button below. Flask SigV4-signs a POST to the Lambda
-        Function URL using credentials from the EC2 instance profile,
-        Lambda runs, and the JSON response shows up here.
+        Click each button. They invoke the same Lambda function, but through
+        very different paths — one server-proxied through Flask, one direct
+        from the browser. Watch the round-trip times and the
+        <code>invocation_path</code> field in the response.
     </p>
 
-    <button class="btn btn-primary" id="hello-btn" onclick="callHello()">
-        Call Lambda
-    </button>
-    <pre id="hello-result" class="hello-result">(not yet called)</pre>
+    <div class="path-comparison">
+        <div class="path-panel">
+            <div class="path-label path-label-stage1">Stage 1</div>
+            <h3 class="path-title">Server proxy</h3>
+            <p class="path-arch">
+                Browser → Flask <code>/api/hello</code> →
+                SigV4-signed → Lambda Function URL → Lambda
+            </p>
+            <p class="path-trust">
+                <strong>Trust:</strong> Flask's EC2 instance role signs the call.
+                User identity is forwarded in the JSON body — Lambda trusts
+                whatever Flask says, because only Flask's role can sign.
+            </p>
+            <button class="btn btn-primary" id="stage1-btn" onclick="callStage1()">
+                Call via Flask
+            </button>
+            <pre id="stage1-result" class="hello-result">(not yet called)</pre>
+        </div>
+
+        <div class="path-panel">
+            <div class="path-label path-label-stage2">Stage 2</div>
+            <h3 class="path-title">Browser direct</h3>
+            <p class="path-arch">
+                Browser → API Gateway →
+                JWT authorizer → Lambda
+            </p>
+            <p class="path-trust">
+                <strong>Trust:</strong> Browser fetches a short-lived JWT from
+                <code>/auth/token</code>, presents it to API Gateway. API Gateway
+                validates signature, issuer, audience, and expiry against the
+                gateway's published JWKS. Identity comes from verified claims —
+                Lambda trusts API Gateway's gate.
+            </p>
+            <button class="btn btn-primary" id="stage2-btn" onclick="callStage2()">
+                Call via API Gateway
+            </button>
+            <pre id="stage2-result" class="hello-result">(not yet called)</pre>
+        </div>
+    </div>
 
     <h2 class="section-title">Headers received from the gateway</h2>
     <table class="data-table">
@@ -27,19 +63,52 @@
 
     <h2 class="section-title">What's next</h2>
     <p>
-        Stage 2 will add an API Gateway in front of the same Lambda, with a
-        JWT authorizer so the browser can call it directly (no Flask in the
-        request path). See <code>docs/decisions/</code> for the running
-        record of choices.
+        Stage 3 will add a managed database (RDS Postgres) so the Lambda can
+        do real work — read and write per-user state. Stage 4 layers on
+        observability, Stage 5 rate limiting, Stage 6 queuing, and Stage 7
+        extends the auth model so an iOS client can use the same API Gateway
+        path the browser uses today.
     </p>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-async function callHello() {
-    const btn = document.getElementById('hello-btn');
-    const out = document.getElementById('hello-result');
+// API Gateway invoke URL is injected from Flask, which reads it from the
+// API_GATEWAY_URL env var (set after `terraform apply`).
+const API_GATEWAY_URL = "{{ api_gateway_url }}";
+
+// --- Token cache ---
+// We hold the most recent JWT in a closure variable. Refresh proactively
+// when within 2 minutes of expiry, so user clicks never see latency from
+// a token-refresh round-trip.
+let _cachedToken = null;
+let _cachedExp = 0;
+
+async function getToken() {
+    const now = Math.floor(Date.now() / 1000);
+    if (!_cachedToken || _cachedExp - now < 120) {
+        const r = await fetch('/auth/token?audience=lambda-hw');
+        if (!r.ok) {
+            const err = await r.text();
+            throw new Error(`/auth/token failed: ${r.status} ${err}`);
+        }
+        const { access_token } = await r.json();
+        // Decode `exp` directly from the token (no signature check needed —
+        // we got it from our own auth-service over HTTPS).
+        const payload = JSON.parse(atob(
+            access_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
+        ));
+        _cachedToken = access_token;
+        _cachedExp = payload.exp;
+    }
+    return _cachedToken;
+}
+
+// --- Stage 1: Flask server-proxy path ---
+async function callStage1() {
+    const btn = document.getElementById('stage1-btn');
+    const out = document.getElementById('stage1-result');
     btn.disabled = true;
     out.textContent = 'calling...';
     const t0 = performance.now();
@@ -48,7 +117,51 @@ async function callHello() {
         const data = await resp.json();
         const elapsed = (performance.now() - t0).toFixed(0);
         out.textContent =
-            `// round-trip ${elapsed}ms (browser → Flask → Lambda → back)\n` +
+            `// round-trip ${elapsed}ms — browser → Flask → SigV4 → Lambda → back\n` +
+            JSON.stringify(data, null, 2);
+    } catch (e) {
+        out.textContent = 'Error: ' + e;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// --- Stage 2: Browser-direct via API Gateway ---
+async function callStage2() {
+    const btn = document.getElementById('stage2-btn');
+    const out = document.getElementById('stage2-result');
+    btn.disabled = true;
+    out.textContent = 'calling...';
+    if (!API_GATEWAY_URL) {
+        out.textContent = 'Error: API_GATEWAY_URL is not set on the server.\n' +
+                          'Set it in /opt/apps/.env from `terraform output api_gateway_url`.';
+        btn.disabled = false;
+        return;
+    }
+    const t0 = performance.now();
+    try {
+        const token = await getToken();
+        const tTokenReady = performance.now();
+        const resp = await fetch(API_GATEWAY_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + token,
+                'Content-Type': 'application/json',
+            },
+            body: '{}',
+        });
+        if (!resp.ok) {
+            const errText = await resp.text();
+            throw new Error(`HTTP ${resp.status}: ${errText}`);
+        }
+        const data = await resp.json();
+        const tTotal = (performance.now() - t0).toFixed(0);
+        const tToken = (tTokenReady - t0).toFixed(0);
+        const tCall  = (performance.now() - tTokenReady).toFixed(0);
+        out.textContent =
+            `// total ${tTotal}ms — token fetch ${tToken}ms (cached after first), ` +
+            `API Gateway call ${tCall}ms\n` +
+            `// browser → API Gateway → JWT validate → Lambda → back\n` +
             JSON.stringify(data, null, 2);
     } catch (e) {
         out.textContent = 'Error: ' + e;
