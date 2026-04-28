@@ -46,17 +46,29 @@ to a service whose entire job is auth.
 **Alternatives considered:** new dedicated token service. Rejected — would
 have to re-authenticate the same session, doubling complexity for no gain.
 
-### D2.A2 — Algorithm: ES256 (ECDSA P-256)
+### D2.A2 — Algorithm: RS256 (RSA-2048), polymorphic code
 
-Asymmetric so API Gateway can verify without the signing key. ES256 chosen
-over RS256 for a learning-project reason: it's the modern default, has
-smaller signatures (~64 bytes vs ~256), faster signing, and it's worth
-internalizing. RS256 would also work and has slightly more universal tooling.
+**What we actually deployed:** RS256 with a 2048-bit RSA keypair.
+
+**What we originally chose:** ES256 (ECDSA P-256). We built and deployed
+ES256 successfully — token minting, JWKS publishing, browser-side decode
+all worked. Then API Gateway's HTTP API JWT authorizer rejected it at
+runtime with `error_description="signing method ES256 is invalid"`.
+Despite some AWS docs implying ES support, **HTTP API JWT authorizer
+only accepts the RS-family in practice**. We switched to RS256 to
+unblock; the architectural intent and security properties are identical.
 
 **Symmetric (HS256) is structurally wrong here:** API Gateway would need
 the signing key to validate, defeating the whole asymmetric-trust model.
 The auth-service alone holds the private key; API Gateway only needs the
 public key.
+
+**Code is algorithm-agnostic.** `jwt_signer.py` introspects the loaded
+PEM key, detects EC vs RSA, and emits the correct JWK shape. The
+`algorithm` field in the Secrets Manager JSON drives signing and
+JWKS publication. Swapping back to ES256 — or to PS256, RS512, etc. —
+is just an operational change (regenerate keypair, replace secret value,
+restart auth-service); no code edit. See lessons learned at the bottom.
 
 ### D2.A3 — Private key in AWS Secrets Manager, single JSON entry, manual provisioning
 
@@ -83,23 +95,34 @@ rotation overlap.
 **Why manual provisioning, not terraform-generated:** terraform's
 `tls_private_key` would put the private key in tfstate, which lives in
 S3. Even with bucket encryption, that's the wrong operational pattern —
-private keys shouldn't traverse IaC. One-time setup script:
+private keys shouldn't traverse IaC. One-time setup script (RSA-2048
+form, what's deployed today):
 
 ```bash
-openssl ecparam -name prime256v1 -genkey -noout -out /tmp/jwt-priv.pem
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/jwt-priv.pem
 openssl pkey -in /tmp/jwt-priv.pem -pubout -out /tmp/jwt-pub.pem
 KID=$(openssl dgst -sha256 /tmp/jwt-pub.pem | awk '{print substr($2,1,16)}')
 SECRET_JSON=$(jq -n \
     --rawfile priv /tmp/jwt-priv.pem \
     --rawfile pub  /tmp/jwt-pub.pem \
     --arg kid "$KID" \
-    '{algorithm:"ES256", kid:$kid, private_key:$priv, public_key:$pub}')
-aws secretsmanager create-secret --name gateway/jwt-signing-key \
-    --description "ES256 keypair for signing gateway-issued JWTs." \
+    '{algorithm:"RS256", kid:$kid, private_key:$priv, public_key:$pub}')
+aws secretsmanager put-secret-value \
+    --secret-id gateway/jwt-signing-key \
     --secret-string "$SECRET_JSON"
 shred -u /tmp/jwt-priv.pem /tmp/jwt-pub.pem 2>/dev/null \
     || rm -f /tmp/jwt-priv.pem /tmp/jwt-pub.pem
 ```
+
+For an EC keypair (ES256, would need a non-API-Gateway verifier), swap
+the first two lines for `openssl ecparam -name prime256v1 -genkey -noout
+-out /tmp/jwt-priv.pem` and the algorithm field for `"ES256"`. The
+auth-service's `jwt_signer.py` handles either kind; only the secret
+value changes.
+
+For first-time creation (vs replacing an existing value), use
+`aws secretsmanager create-secret --name gateway/jwt-signing-key
+--description ... --secret-string ...` instead of `put-secret-value`.
 
 Terraform owns the **secret container** (`aws_secretsmanager_secret`
 resource) and IAM permissions, but never touches the secret value.
@@ -114,28 +137,52 @@ KMS holds the key and signs on request via `kms:Sign`; the key never
 enters auth-service memory. Right answer for production; overkill for
 learning. Documented as future work.
 
-### D2.A4 — JWKS at `/.well-known/jwks.json` on the auth-service
+### D2.A4 — Two public well-known endpoints on the auth-service
 
-Standard well-known location. The route is a Flask handler that:
+Verifiers find our public key via two endpoints, both at standard
+well-known locations:
 
-1. Reads the cached public key from in-memory keypair (loaded once from
-   Secrets Manager at startup).
-2. Converts PEM to JWK format (in-memory math — base64url encoding of
-   the EC point's X/Y coordinates).
-3. Returns `{"keys": [{kty, crv, x, y, use, alg, kid}]}`.
+1. **`/auth/.well-known/openid-configuration`** — minimal OIDC discovery
+   document. API Gateway's JWT authorizer fetches *this first* (given
+   only our issuer URL) to learn where the JWKS lives. We don't
+   implement full OIDC — only the fields a JWT verifier strictly needs:
 
-**No file ever written.** Computation is microseconds; result is cached
-via `lru_cache` and served with `Cache-Control: public, max-age=300`.
+   ```json
+   {
+     "issuer": "https://apps.ksastry.com/auth",
+     "jwks_uri": "https://apps.ksastry.com/auth/.well-known/jwks.json",
+     "id_token_signing_alg_values_supported": ["RS256"]
+   }
+   ```
+
+2. **`/auth/.well-known/jwks.json`** — the JSON Web Key Set: the public
+   half of the keypair, formatted per RFC 7517. The route is a Flask
+   handler that:
+
+   1. Reads the cached public key from the in-memory keypair (loaded
+      once from Secrets Manager at startup).
+   2. Detects whether it's RSA or EC and converts PEM → JWK
+      (in-memory math: base64url-encoding the modulus + exponent for
+      RSA, or the X/Y coordinates for EC).
+   3. Returns `{"keys": [{kty, ..., use, alg, kid}]}`.
+
+**Both endpoints are public** — must be reachable without a session
+cookie because API Gateway, iOS, etc. need to fetch them. Configured in
+nginx to bypass `auth_request` and the `/.` deny rule.
+
+**No files ever written.** All computation is microseconds; results are
+cached via `lru_cache` and served with `Cache-Control: public, max-age=300`.
 API Gateway also internally caches JWKS for ~10 minutes, so traffic to
-this endpoint stays minimal regardless of inbound API request volume.
+either endpoint stays minimal regardless of inbound API request volume.
 
 The `keys` array is plural specifically to support rotation overlap
 windows: during rotation we publish both old and new public keys
 simultaneously, distinguished by `kid`.
 
-This endpoint is **public** — it must be reachable without a session
-cookie because external services (API Gateway, eventually iOS) need to
-fetch it. Will be configured in nginx to bypass `auth_request`.
+**Why both endpoints, not just JWKS:** API Gateway's HTTP API JWT
+authorizer doesn't accept a JWKS URL directly; you give it the issuer
+URL and it requires that issuer to serve OIDC discovery. We discovered
+this the hard way during chunk B → chunk C handoff. See lessons learned.
 
 ### D2.B1 — JWT claims
 
@@ -302,3 +349,81 @@ useful. For now, both stay.
 - **Run terraform as a non-root IAM identity.** Stage 1 inherited a
   root-credentials habit; this stage should not perpetuate it. If
   not yet fixed, do it before next apply.
+
+## Lessons learned (debugging chunks B and C)
+
+### Lesson 1 — HTTP API JWT authorizer requires OIDC discovery, not just JWKS
+
+When you set `issuer = "https://apps.ksastry.com/auth"` on the
+authorizer, API Gateway fetches `<issuer>/.well-known/openid-configuration`
+to find the JWKS URI — it does NOT accept a JWKS URL directly. You need
+to publish a *minimal* OIDC discovery document at that path. The bare
+minimum is:
+
+```json
+{
+  "issuer": "https://apps.ksastry.com/auth",
+  "jwks_uri": "https://apps.ksastry.com/auth/.well-known/jwks.json",
+  "id_token_signing_alg_values_supported": ["RS256"]
+}
+```
+
+Real OIDC providers include `authorization_endpoint`, `token_endpoint`,
+`response_types_supported`, and many other fields. We don't need any of
+those — we're not implementing a full OIDC IdP, just enough to be
+JWKS-discoverable. AWS docs don't make this requirement obvious.
+
+### Lesson 2 — HTTP API JWT authorizer rejects ES256 in practice
+
+**Symptom:** API Gateway returns 401 with header
+`error_description="signing method ES256 is invalid"` even though our
+JWT, JWKS, and OIDC discovery doc were all internally consistent.
+
+**Cause:** Despite some AWS docs implying ES-family algorithms are
+supported, HTTP API's JWT authorizer accepts only the **RS-family**
+(RS256/384/512) in practice. There are scattered reports of this in
+GitHub issues; AWS hasn't published a definitive list.
+
+**Fix:** Switch to RS256. We replaced the keypair value in Secrets
+Manager (no terraform change needed since terraform owns only the
+container) and restarted auth-service. The polymorphic `jwt_signer.py`
+code emits the right JWK shape based on the key type, so no Python
+edit either.
+
+**Defensive design that paid off:** because we made the algorithm
+field of the secret value drive both signing and JWKS publication,
+swapping algorithms was an operational change, not a code change.
+This is a pattern worth keeping in any signing system.
+
+**Workarounds if you need ES support:** REST API + custom Lambda
+authorizer (3.5× cost, more code), or validate JWTs inside the Lambda
+itself (loses the "Lambda doesn't run if auth fails" property).
+Neither is worth it for our case.
+
+### Lesson 3 — Git hygiene for new directories
+
+During the chunk B → main merge, the entire `terraform/auth-service/`
+directory disappeared from the squash commit because every file in it
+was untracked when the original commits were made. `git add` on
+specific paths missed the directory; the soft-reset preserved an
+already-incomplete index. Recovery was easy because the JWT-tokens
+branch wasn't deleted yet.
+
+**Habits to internalize:**
+- `git status` *before every commit*, even when you think you know
+  what's there.
+- For new directories, use `git add <dir>/` explicitly. `git commit -a`
+  only touches already-tracked files — that's the trap.
+- Don't delete feature branches until you're sure main has everything.
+  `git branch -d JWT-tokens` is cheap insurance.
+
+### Lesson 4 — Provisioning patterns for cross-repo dependencies
+
+Stage 2's design correctly split the work across two repos: gateway-side
+infrastructure (signing key, IAM, route code) versus app-side
+infrastructure (API Gateway, JWT authorizer config). The lambda-hw
+terraform references the gateway's JWKS URL as a hardcoded HTTPS string,
+not as a cross-repo IaC dependency. This is the right pattern: it keeps
+each project's terraform self-contained and lets either side be replaced
+without touching the other. **Worth keeping for any future
+multi-app/multi-repo setup.**
