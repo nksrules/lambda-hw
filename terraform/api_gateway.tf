@@ -93,10 +93,47 @@ resource "aws_apigatewayv2_route" "hello" {
 # `$default` is a special stage that gets the bare URL (no /stage-name
 # prefix). `auto_deploy = true` means route changes go live immediately
 # instead of needing an explicit deployment resource.
+#
+# access_log_settings: per-request structured JSON log written to the
+# access log group. API Gateway substitutes $context.* fields at request
+# time (not at terraform-plan time). The format is a single JSON line per
+# request, parseable directly by Logs Insights — no pattern parsing needed.
+#
+# What's in each log line:
+#   - request shape: method, route, status, latency, size, source IP
+#   - integration shape: latency Lambda took, status Lambda returned
+#   - auth shape: JWT claims if validation succeeded, error if it didn't
+#   - error shape: API Gateway-side errors (e.g., bad JWT, throttled)
+# When auth fails, $context.error.* is populated and Lambda is never invoked
+# — exactly what we want to see in the audit log.
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.lambda_hw.id
   name        = "$default"
   auto_deploy = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_gateway_access.arn
+    format = jsonencode({
+      requestId          = "$context.requestId"
+      requestTime        = "$context.requestTime"
+      ip                 = "$context.identity.sourceIp"
+      httpMethod         = "$context.httpMethod"
+      routeKey           = "$context.routeKey"
+      status             = "$context.status"
+      responseLength     = "$context.responseLength"
+      integrationLatency = "$context.integrationLatency"
+      integrationStatus  = "$context.integrationStatus"
+      # JWT-authorizer fields (populated when auth succeeds)
+      authorizerStatus = "$context.authorizer.status"
+      userSub          = "$context.authorizer.claims.sub"
+      username         = "$context.authorizer.claims.username"
+      role             = "$context.authorizer.claims.role"
+      # Error fields (populated when API Gateway rejects the request)
+      authorizerError   = "$context.authorizer.error"
+      errorMessage      = "$context.error.message"
+      errorResponseType = "$context.error.responseType"
+    })
+  }
 }
 
 # ---------------------------------------------------------------------------

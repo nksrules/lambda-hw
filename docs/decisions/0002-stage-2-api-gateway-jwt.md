@@ -287,7 +287,7 @@ ARN directly. After Stage 2, the Lambda's Function URL still exists
 trusting the JWT inside the Lambda is safe: any path that delivered
 the request is one we control.
 
-### D2.D2 — Keep Stage 1 server-proxy path side-by-side
+### D2.D2 — Keep Stage 1 server-proxy path side-by-side (learning-only)
 
 Two buttons on the lambda-hw page: **Call via Flask (Stage 1)** and
 **Call via API Gateway (Stage 2)**. Both call the same Lambda, both
@@ -295,8 +295,64 @@ display response + measured round-trip time. The whole point is to
 feel the contrast — different auth model, different network path,
 different observable latency profile.
 
-We can clean up later by removing Stage 1's button when it's no longer
-useful. For now, both stay.
+**This is not the production-shape architecture.** A real lambda-hw
+would have ONE ingress per Lambda (API Gateway), and the Function URL
++ Flask server-proxy path would be removed entirely. Multiple ingresses
+to the same Lambda complicate trust analysis, monitoring, and rate
+limiting. We keep both purely because the side-by-side comparison is
+the learning artifact. See D2.D3 for the production-shape rationale.
+
+### D2.D3 — Production architecture: one ingress per Lambda, one API Gateway per app
+
+Two architectural rules of thumb that emerged from clarifying questions
+during chunk D:
+
+**Rule 1: One API Gateway *per app*, many Lambdas *per API Gateway*.**
+
+A single API Gateway HTTP API can have many routes, each integrated
+with a different Lambda:
+
+```
+lambda-hw API Gateway:
+    POST /hello         → lambda-hw-hello
+    POST /things        → lambda-hw-create-thing
+    GET  /things/{id}   → lambda-hw-get-thing
+```
+
+All under one API, one JWT authorizer, one CORS config, one audience
+(`aud: "lambda-hw"`). As lambda-hw grows, we add routes here.
+
+For *multiple apps*, each gets its own API Gateway. Reasons: audience
+scoping matches one-API-one-app naturally; per-app terraform stays
+clean; blast radius contained; HTTP API has no per-API base charge so
+it's cost-neutral.
+
+**Rule 2: One ingress per Lambda in production. We have two for learning.**
+
+Production Lambda functions almost always have a single invocation
+path. Reasons:
+- Single trust boundary — much easier to reason about security.
+- Easier monitoring / metrics / log aggregation.
+- Rate limiting / WAF apply once.
+- The Lambda code reads identity from one place, not two.
+
+Legitimate exceptions to the "one ingress" rule:
+- Public webhooks (HMAC-validated) + authenticated user calls (JWT) —
+  same business logic, two distinct caller populations.
+- API Gateway for browser/mobile + direct Lambda invoke for internal
+  cron/Step Functions — different audiences, both legitimate.
+
+What we have (Function URL + API Gateway, both for the same browser
+audience) is **not** one of those exceptions; it's a learning artifact.
+A production cleanup would delete the Function URL, the inline IAM
+policy granting `lambda:InvokeFunctionUrl`, the resource-based policy
+on the function, and the Flask `/api/hello` server-proxy code. The
+button removal would follow.
+
+**Preferred ingress for our shape (web + future iOS): API Gateway with JWT.**
+Function URL + IAM is the right pick only when callers are
+exclusively AWS services or your own server fleet, with no need for
+user-level identity inside the Lambda.
 
 ## What we did NOT do (intentionally)
 
@@ -427,3 +483,39 @@ not as a cross-repo IaC dependency. This is the right pattern: it keeps
 each project's terraform self-contained and lets either side be replaced
 without touching the other. **Worth keeping for any future
 multi-app/multi-repo setup.**
+
+### Lesson 5 — CSP is the *other* browser security mechanism
+
+After CORS was correctly configured on API Gateway, the browser still
+refused to send the request — not with a CORS error, but with a CSP
+(Content Security Policy) violation:
+
+> Refused to connect because it violates the document's Content Security Policy.
+
+The gateway's nginx sets a strict `default-src 'self'` CSP, which
+governs *outbound* connections via `connect-src` when not specified
+explicitly. With no `connect-src` directive, the browser refused any
+fetch to a different origin — including our API Gateway URL.
+
+**Fix:** add `connect-src 'self' https://*.execute-api.us-east-1.amazonaws.com`
+to the CSP header in `gateway/nginx.conf`. This is a gateway-level
+concern: the same CSP serves every app, and any future app behind this
+gateway that fetches API Gateway endpoints in us-east-1 is now covered.
+
+**Mental model: the three browser security gates and what each governs:**
+
+| Gate | What it does | Configured at |
+|---|---|---|
+| **Same-Origin Policy** | Default browser sandbox (built-in) | (browser; CORS+CSP relax it) |
+| **CORS** | Cross-origin response readability — "can this page read what came back?" | The *responder* (API Gateway) |
+| **CSP** | Outbound request permission — "can this page even attempt this request?" | The *page server* (nginx) |
+
+Our chunk D needed both: API Gateway's CORS to allow the browser to
+read responses, and nginx's CSP to allow the browser to send the
+request in the first place. Hitting CORS and not CSP usually means
+your same-origin assumptions broke; hitting CSP without CORS means
+the browser rejected the request before any network attempt.
+
+When debugging "TypeError: Failed to fetch" with no other context,
+check both — the order in the browser is CSP first (request blocked
+outright), then CORS (request sent, response withheld).

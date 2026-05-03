@@ -19,3 +19,15 @@ variable "ec2_invoker_role_name" {
   type        = string
   default     = "apps-ec2-role"
 }
+
+variable "alarm_email" {
+  description = <<-EOT
+    Email address that receives CloudWatch alarm and AWS Budgets
+    notifications. The SNS email subscription created by terraform is
+    "PendingConfirmation" until you click the confirmation link AWS
+    sends to this address. Until confirmed, alarms still fire but no
+    email is delivered.
+  EOT
+  type        = string
+  default     = "nbuy@ksastry.com"
+}

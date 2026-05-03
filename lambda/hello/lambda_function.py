@@ -15,12 +15,28 @@ We distinguish the two at runtime by whether `claims` is present, and
 echo back which path was taken so the UI can show the side-by-side
 comparison.
 
-No third-party imports — only stdlib — so packaging stays trivial.
+Stage 4 logging: when the function's `logging_config.log_format` is set
+to JSON in terraform, the Lambda runtime turns each `logger.info(...)`
+call into a structured CloudWatch event. The `extra={...}` dict gets
+merged in at the top level alongside built-in fields like `requestId`,
+`level`, `message`, `timestamp`. That makes Logs Insights queries trivial.
+
+No third-party imports — only stdlib.
 """
 
 import json
+import logging
 import os
 import time
+
+
+# Module-level logger configuration.
+# - level INFO captures the bulk of operational logs but skips DEBUG noise.
+# - We attach to the root logger because Lambda's runtime instruments root,
+#   not the package logger; using __name__ would still work but root is
+#   the documented surface.
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
 def _extract_identity(event: dict) -> tuple[str, dict]:
@@ -49,7 +65,11 @@ def _extract_identity(event: dict) -> tuple[str, dict]:
     body_raw = event.get("body") or "{}"
     try:
         body = json.loads(body_raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "invalid_json_body",
+            extra={"event": "invalid_json", "error": str(e)},
+        )
         body = {}
     return "function-url-iam", {
         "sub":          None,
@@ -60,6 +80,8 @@ def _extract_identity(event: dict) -> tuple[str, dict]:
 
 
 def handler(event, context):
+    t0 = time.perf_counter()
+
     invocation_path, ident = _extract_identity(event)
     display_name = ident["display_name"] or "stranger"
 
@@ -78,8 +100,29 @@ def handler(event, context):
         "server_time_unix": int(time.time()),
     }
 
-    return {
+    out = {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps(response),
     }
+
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    # One structured event per invocation. Goes into CloudWatch Logs as
+    # JSON because logging_config.log_format = "JSON" in terraform.
+    # Logs Insights queries:
+    #   fields @timestamp, invocation_path, latency_ms, status
+    #   | filter level = "INFO" and event = "invocation"
+    #   | stats avg(latency_ms), count() by invocation_path
+    logger.info(
+        "invocation",
+        extra={
+            "event":           "invocation",
+            "invocation_path": invocation_path,
+            "username":        ident["username"],
+            "display_name":    ident["display_name"],
+            "latency_ms":      latency_ms,
+            "status":          out["statusCode"],
+        },
+    )
+
+    return out

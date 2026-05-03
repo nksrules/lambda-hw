@@ -46,6 +46,17 @@ resource "aws_lambda_function" "hello" {
 
   timeout     = 5   # seconds; hello world should be near-instant
   memory_size = 128 # MB; smallest tier
+
+  # Stage 4: structured JSON logging.
+  # When log_format = "JSON", the Lambda runtime turns every log event
+  # (including ours via logger.info(..., extra={...})) into a JSON
+  # object at the top level: {timestamp, level, message, requestId, ...}
+  # plus our extra fields. Logs Insights queries fields directly.
+  logging_config {
+    log_format            = "JSON"
+    application_log_level = "INFO"
+    system_log_level      = "INFO"
+  }
 }
 
 # The HTTPS endpoint attached directly to the function.
