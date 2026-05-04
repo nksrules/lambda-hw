@@ -113,7 +113,9 @@ def _generate_db_auth_token() -> str:
     No network call; very fast (~1ms).
 
     The returned token is the password for the next psycopg.connect call.
-    RDS validates the signature against IAM at connection time.
+    RDS validates the signature against IAM at connection time. Once the
+    connection is established, the token is no longer relevant — RDS
+    doesn't re-validate it during the connection's lifetime.
     """
     return _rds_client.generate_db_auth_token(
         DBHostname=DB_ENDPOINT,
@@ -123,21 +125,64 @@ def _generate_db_auth_token() -> str:
     )
 
 
-def _connect_db() -> "psycopg.Connection":
-    """Open a fresh psycopg connection. Caller is responsible for closing
-    (typically via `with _connect_db() as conn:` block).
+# ---------------------------------------------------------------------------
+# Module-level connection cache (Stage 3 perf optimization, "Lever 1")
+# ---------------------------------------------------------------------------
+# Lambda containers handle one invocation at a time, so a global connection
+# is safe (no locking needed). Caching at module scope amortizes the
+# ~200ms TLS+IAM+Postgres-auth handshake across warm invocations:
+#   - First invocation per container: ~200ms to open
+#   - Each subsequent invocation: ~3ms (SELECT 1 check) + actual query
+#
+# Stale-connection handling: when the container freezes for hours (idle),
+# RDS may close the connection from its side. We validate with a cheap
+# SELECT 1 before each use and reconnect on failure.
+#
+# autocommit=True: each statement is its own implicit transaction, no
+# state to manage across invocations. Suits our single-statement upsert.
 
-    `sslmode="require"` is mandatory for IAM-auth users — RDS rejects
-    plain TCP connections from rds_iam-membered users.
+_db_conn = None
+
+
+def _get_db_connection() -> "psycopg.Connection":
+    """Return a healthy connection, opening or reconnecting as needed.
+
+    Cheap fast path: cached connection passes a SELECT 1 validation.
+    Slow path: connection missing or stale → open fresh with new
+    IAM token.
+
+    Caller does NOT close the returned connection — it's the cached
+    instance, reused across invocations.
     """
-    return psycopg.connect(
+    global _db_conn
+
+    # Fast path: connection exists and responds.
+    if _db_conn is not None and not _db_conn.closed:
+        try:
+            with _db_conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return _db_conn
+        except psycopg.Error:
+            # Connection dead. Try to close cleanly, then reopen.
+            try:
+                _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
+
+    # Slow path: open a new connection. The IAM token is generated
+    # locally (no network call); the actual TLS handshake to RDS is
+    # what costs real time here.
+    _db_conn = psycopg.connect(
         host=DB_ENDPOINT,
         port=5432,
         dbname=DB_NAME,
         user=DB_USER,
         password=_generate_db_auth_token(),
         sslmode="require",
+        autocommit=True,
     )
+    return _db_conn
 
 
 def _upsert_visit(sub: str, username: str) -> dict:
@@ -147,25 +192,29 @@ def _upsert_visit(sub: str, username: str) -> dict:
     and "insert/update". Two concurrent invocations for the same user
     would be linearized by the primary key constraint on `sub`.
 
+    Uses the cached module-level connection. Connection lifecycle is
+    managed by _get_db_connection — caller does NOT close it.
+
     Returns dict with click_count, first_seen, last_seen, db_elapsed_ms.
     """
     t0 = time.perf_counter()
-    with _connect_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO user_visits (sub, username, click_count, first_seen, last_seen)
-                VALUES (%s, %s, 1, now(), now())
-                ON CONFLICT (sub) DO UPDATE
-                  SET click_count = user_visits.click_count + 1,
-                      username    = EXCLUDED.username,
-                      last_seen   = now()
-                RETURNING click_count, first_seen, last_seen
-                """,
-                (sub, username),
-            )
-            click_count, first_seen, last_seen = cur.fetchone()
-        # `with conn:` commits on success and closes the connection here.
+    conn = _get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO user_visits (sub, username, click_count, first_seen, last_seen)
+            VALUES (%s, %s, 1, now(), now())
+            ON CONFLICT (sub) DO UPDATE
+              SET click_count = user_visits.click_count + 1,
+                  username    = EXCLUDED.username,
+                  last_seen   = now()
+            RETURNING click_count, first_seen, last_seen
+            """,
+            (sub, username),
+        )
+        click_count, first_seen, last_seen = cur.fetchone()
+    # autocommit=True means the upsert was committed at execute() time.
+    # Connection stays open for reuse on the next invocation.
 
     return {
         "click_count":    click_count,

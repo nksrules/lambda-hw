@@ -404,9 +404,121 @@ a hardcoded string somewhere — fragile.
   optional infrastructure.
 - **AWS service quirks aren't always documented.** Stage 1 taught
   resource policies; Stage 2 OIDC discovery + ES256; Stage 4
-  retention granularity. Budget time for one such surprise in
-  Stage 3 — likely candidates: VPC Lambda cold-start ENI quirks,
-  RDS Proxy IAM token format, security group cycle-detection.
+  retention granularity. Stage 3 had its own — see "Lessons learned"
+  below.
 - **Run terraform as a non-root IAM identity.** Still an open item.
   This is the right stage to finally fix it before we add another
   terraform project.
+
+## Lessons learned (debugging Stage 3 deploys)
+
+### Lesson 1 — RDS Proxy requires per-Postgres-user Secrets Manager auth blocks (even with IAM)
+
+We initially provisioned RDS Proxy thinking IAM auth on the front side
+would be enough. It's not. Symptom:
+
+```
+FATAL: This RDS proxy has no credentials for the role lambda_hw_app.
+```
+
+The Proxy's auth model: clients authenticate to the Proxy with IAM
+tokens, but the Proxy needs **its own way** to authenticate to RDS to
+maintain the connection pool. That requires a Secrets Manager secret
+with stored Postgres credentials, plus an `auth` block on
+`aws_db_proxy` referencing it. **Per Postgres user.** Even when
+`iam_auth = "REQUIRED"`.
+
+This means adding a tenant Postgres user with Proxy support is
+genuinely 3 coordinated changes:
+
+1. `ALTER USER X WITH PASSWORD '<random>'` in Postgres (give the user
+   an actual stored password, even though we still want IAM auth on
+   the Proxy front side)
+2. Create a Secrets Manager secret with that username + password
+3. Add a second `auth` block on `aws_db_proxy` referencing the secret
+
+We hit this, decided the Proxy wasn't worth the per-tenant operational
+complexity at our scale, and toggled it off. The pattern remains in
+code (`var.enable_rds_proxy`) for future re-enable when justified.
+
+**Implication for the decision doc:** RDS Proxy is "right" only when
+you have enough concurrency that connection exhaustion is a real risk
+*and* the operational cost of maintaining auth blocks per tenant is
+absorbed. For ~handful-of-requests-per-day workloads, direct RDS +
+connection caching wins.
+
+### Lesson 2 — Cross-project terraform changes don't auto-cascade
+
+When `gateway/terraform/data-platform/` flipped `enable_rds_proxy` from
+`true` to `false`, the platform's `db_endpoint` output changed
+(Proxy → direct RDS). lambda-hw's terraform reads that via
+`terraform_remote_state` data source, but **the change doesn't
+propagate to AWS until you explicitly `terraform apply` lambda-hw**.
+The Lambda's environment variable kept pointing at the dead Proxy
+hostname, with predictable failure.
+
+**Pattern to internalize:** any time gateway/data-platform terraform
+changes outputs that lambda-hw consumes, lambda-hw must re-apply.
+This is the pull model — tenants pull from platform state on demand,
+not pushed at them. CI pipelines automate it; manual workflows need
+discipline.
+
+### Lesson 3 — Lambda env var changes don't update warm containers
+
+After `terraform apply` updates a function's env vars, the new values
+take effect on **new container starts** — but warm containers
+already running may continue with the old values until they shut down
+(can be 10-15 min). For our case the proxy hostname change manifested
+as confusing intermittency: some invocations failed with stale env,
+others succeeded as new containers came online.
+
+**Mental model:** Lambda env vars are baked into the container at
+launch, not refreshed mid-life. If you need an instant cycle, force
+new containers via `aws lambda update-function-code` or by changing
+some other config attribute that triggers replacement.
+
+### Lesson 4 — psycopg arm64 wheels work first-try with `pip --platform`
+
+This one was actually a positive surprise. We worried Docker would be
+needed to build psycopg for Lambda's arm64 Linux. PyPI's
+`manylinux2014_aarch64` wheels for `psycopg-binary` worked perfectly
+with:
+
+```bash
+pip install --platform manylinux2014_aarch64 \
+    --target build/python --implementation cp --python-version 3.12 \
+    --only-binary=:all: --upgrade psycopg[binary]
+```
+
+No Docker, no toolchain, layer ZIP came out clean. The terraform
+`null_resource` provisioner for it is ~10 lines.
+
+The recipe generalizes for other Python packages with C extensions
+(numpy, cryptography, pillow): if PyPI has manylinux wheels for arm64,
+this approach works. Falls down only when wheels aren't available
+(less common than it used to be).
+
+### Lesson 5 — Connection per invocation is slow; cache at module scope
+
+Our D3.5 chose "connection per invocation" for simplicity. In practice
+this costs ~150-200ms per warm invocation (TLS handshake + IAM token
+validation + Postgres protocol auth). The actual SQL upsert is
+microseconds.
+
+Module-level caching with `try { ping } catch { reconnect }` recovers
+most of that latency at the cost of ~10 lines of code and slightly
+more careful lifecycle handling. Worth doing when latency starts to
+matter; we're shipping the simpler pattern first as a baseline.
+
+Performance breakdown in our actual measurements (warm, post-
+deploy):
+- API Gateway → Lambda routing + JWT validate: ~10ms
+- Lambda invoke + handler: ~5ms
+- DB connection setup: ~150-200ms
+- SQL upsert itself: ~5ms
+- Network round-trip (browser ↔ AWS): ~50ms
+- Total: ~250-350ms
+
+With module-level connection caching, total drops to ~100-150ms.
+With DynamoDB (different access pattern, no connection model),
+~50-80ms is realistic.
