@@ -39,13 +39,46 @@ resource "aws_lambda_function" "hello" {
   function_name = var.function_name
   role          = aws_iam_role.hello_exec.arn
   runtime       = "python3.12"
+  architectures = ["arm64"] # Stage 3 D3.4 — Graviton, matches DB architecture, ~20% cheaper compute
   handler       = "lambda_function.handler"
 
   filename         = data.archive_file.hello_zip.output_path
   source_code_hash = data.archive_file.hello_zip.output_base64sha256
 
-  timeout     = 5   # seconds; hello world should be near-instant
-  memory_size = 128 # MB; smallest tier
+  # Stage 3 chunk E.1 — Postgres driver layer. Lambda runtime mounts
+  # this at /opt/python/, so `import psycopg` resolves at handler time.
+  layers = [aws_lambda_layer_version.psycopg.arn]
+
+  # Bumped from 5/128 in Stage 3: DB connection setup adds latency,
+  # psycopg in memory adds footprint. Lambda CPU also scales with memory,
+  # so 256 MB is faster on the same workload.
+  timeout     = 10
+  memory_size = 256
+
+  # Stage 3 chunk C — VPC config: place the Lambda in the data-platform's
+  # private subnets, with both this app's SG and the platform's
+  # tenant-db-client marker SG. The marker is the admission ticket; the
+  # platform's RDS-side SG allows ingress from it.
+  vpc_config {
+    subnet_ids = values(data.terraform_remote_state.data_platform.outputs.private_subnet_ids)
+    security_group_ids = [
+      aws_security_group.lambda_hw.id,
+      data.terraform_remote_state.data_platform.outputs.tenant_db_client_sg_id,
+    ]
+  }
+
+  # Stage 3 chunk C — env vars consumed by the Lambda code in chunk E.
+  # DB_ENDPOINT is sourced from the platform's terraform output and
+  # transparently flips between Proxy endpoint and direct RDS endpoint
+  # depending on platform's enable_rds_proxy variable. Lambda code
+  # connects to whatever this resolves to without knowing which.
+  environment {
+    variables = {
+      DB_ENDPOINT = data.terraform_remote_state.data_platform.outputs.db_endpoint
+      DB_NAME     = "lambda_hw"
+      DB_USER     = "lambda_hw_app"
+    }
+  }
 
   # Stage 4: structured JSON logging.
   # When log_format = "JSON", the Lambda runtime turns every log event

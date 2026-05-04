@@ -1,0 +1,8 @@
+# Psycopg 3 — Postgres driver for the lambda-hw Lambda.
+# `[binary]` extra ships statically-linked libpq, so the layer doesn't
+# need any system libraries on the Lambda runtime side.
+#
+# Pinned to 3.x major (avoids future 4.x breakage) but allowing minor
+# updates. terraform's null_resource detects changes to this file and
+# rebuilds the layer.
+psycopg[binary]>=3.2,<4

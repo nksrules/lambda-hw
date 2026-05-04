@@ -116,3 +116,57 @@
 .path-panel .hello-result {
     font-size: 0.78rem;
 }
+
+/* --- Visit counter card (Stage 3) --- */
+
+.visit-card {
+    margin-top: 1rem;
+    padding: 1rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: center;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.visit-card-active {
+    border-color: var(--primary);
+    background: var(--card);
+}
+
+.visit-count {
+    font-family: var(--font-serif);
+    font-size: 2.5rem;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--text);
+    margin: 0;
+}
+
+.visit-card-active .visit-count {
+    color: var(--primary);
+}
+
+.visit-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+    margin: 0.25rem 0 0.75rem;
+}
+
+.visit-meta {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-align: left;
+    display: inline-block;
+}
+
+.visit-meta div {
+    margin: 0.1rem 0;
+}
+
+.visit-meta span {
+    color: var(--text);
+}

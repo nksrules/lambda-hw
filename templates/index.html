@@ -47,6 +47,17 @@
             <button class="btn btn-primary" id="stage2-btn" onclick="callStage2()">
                 Call via API Gateway
             </button>
+
+            <div class="visit-card" id="visit-card">
+                <div class="visit-count" id="visit-count">—</div>
+                <div class="visit-label">click count</div>
+                <div class="visit-meta">
+                    <div>first seen: <span id="visit-first">—</span></div>
+                    <div>last seen:  <span id="visit-last">—</span></div>
+                    <div>db query:   <span id="visit-db-time">—</span></div>
+                </div>
+            </div>
+
             <pre id="stage2-result" class="hello-result">(not yet called)</pre>
         </div>
     </div>
@@ -63,11 +74,12 @@
 
     <h2 class="section-title">What's next</h2>
     <p>
-        Stage 3 will add a managed database (RDS Postgres) so the Lambda can
-        do real work — read and write per-user state. Stage 4 layers on
-        observability, Stage 5 rate limiting, Stage 6 queuing, and Stage 7
-        extends the auth model so an iOS client can use the same API Gateway
-        path the browser uses today.
+        Stage 3 (database) and Stage 4 (logging &amp; observability) are
+        live. The click counter above is backed by RDS Postgres in a private
+        VPC, accessed via IAM auth (no stored DB password). Stage 5 will add
+        rate limiting, Stage 6 queueing (SQS), and Stage 7 extends the auth
+        model so an iOS client can use the same API Gateway path the browser
+        uses today.
     </p>
 </div>
 {% endblock %}
@@ -126,6 +138,45 @@ async function callStage1() {
     }
 }
 
+// --- Relative-time helper for the visit card ---
+// "12s ago", "3m ago", "5h ago", "2d ago". Falls back to ISO string for older.
+function formatRelativeTime(isoStr) {
+    if (!isoStr) return '—';
+    const t = new Date(isoStr).getTime();
+    if (isNaN(t)) return isoStr;
+    const diffSec = Math.floor((Date.now() - t) / 1000);
+    if (diffSec < 0)   return 'in the future?';
+    if (diffSec < 5)   return 'just now';
+    if (diffSec < 60)  return diffSec + 's ago';
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60)  return diffMin + 'm ago';
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return diffHour + 'h ago';
+    const diffDay = Math.floor(diffHour / 24);
+    if (diffDay < 30)  return diffDay + 'd ago';
+    return isoStr.slice(0, 10);  // YYYY-MM-DD for older
+}
+
+// --- Render the visit card from a response's `visit` object ---
+function renderVisit(visit) {
+    const card = document.getElementById('visit-card');
+    if (!visit) {
+        // Stage 2 succeeded but DB wasn't reachable (graceful-degrade case)
+        // OR this was a Stage 1 call (which doesn't write).
+        document.getElementById('visit-count').textContent    = '—';
+        document.getElementById('visit-first').textContent    = '—';
+        document.getElementById('visit-last').textContent     = '—';
+        document.getElementById('visit-db-time').textContent  = '(no DB call)';
+        card.classList.remove('visit-card-active');
+        return;
+    }
+    document.getElementById('visit-count').textContent    = visit.click_count;
+    document.getElementById('visit-first').textContent    = formatRelativeTime(visit.first_seen);
+    document.getElementById('visit-last').textContent     = formatRelativeTime(visit.last_seen);
+    document.getElementById('visit-db-time').textContent  = visit.db_elapsed_ms + 'ms';
+    card.classList.add('visit-card-active');
+}
+
 // --- Stage 2: Browser-direct via API Gateway ---
 async function callStage2() {
     const btn = document.getElementById('stage2-btn');
@@ -163,8 +214,10 @@ async function callStage2() {
             `API Gateway call ${tCall}ms\n` +
             `// browser → API Gateway → JWT validate → Lambda → back\n` +
             JSON.stringify(data, null, 2);
+        renderVisit(data.visit);
     } catch (e) {
         out.textContent = 'Error: ' + e;
+        renderVisit(null);
     } finally {
         btn.disabled = false;
     }
