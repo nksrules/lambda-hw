@@ -32,9 +32,11 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 import boto3
 import psycopg
+from botocore.config import Config
 
 
 logger = logging.getLogger()
@@ -49,12 +51,26 @@ logger.setLevel(logging.INFO)
 # init cost. boto3 client is lightweight to create but not free; pulling
 # it out here matters at scale.
 
-DB_ENDPOINT = os.environ.get("DB_ENDPOINT", "")
-DB_NAME     = os.environ.get("DB_NAME", "lambda_hw")
-DB_USER     = os.environ.get("DB_USER", "lambda_hw_app")
-AWS_REGION  = os.environ.get("AWS_REGION", "us-east-1")
+DB_ENDPOINT   = os.environ.get("DB_ENDPOINT", "")
+DB_NAME       = os.environ.get("DB_NAME", "lambda_hw")
+DB_USER       = os.environ.get("DB_USER", "lambda_hw_app")
+AWS_REGION    = os.environ.get("AWS_REGION", "us-east-1")
+SQS_AUDIT_URL = os.environ.get("SQS_AUDIT_URL", "")  # Stage 6: audit queue
 
 _rds_client = boto3.client("rds", region_name=AWS_REGION)
+
+# Tight timeouts on the SQS client so a misconfigured network path fails
+# fast (3s) instead of letting the Lambda time out at 10s. boto3 default
+# is 60s connect / 60s read, which is wrong for serverless.
+_sqs_client = boto3.client(
+    "sqs",
+    region_name=AWS_REGION,
+    config=Config(
+        connect_timeout=3,
+        read_timeout=3,
+        retries={"max_attempts": 1},
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +201,61 @@ def _get_db_connection() -> "psycopg.Connection":
     return _db_conn
 
 
+# ---------------------------------------------------------------------------
+# Stage 6 — async audit log via SQS
+# ---------------------------------------------------------------------------
+# After the synchronous upsert into user_visits succeeds, drop a message
+# on the click-audit queue. A separate consumer Lambda (audit_consumer)
+# will pick it up and write a permanent record to click_audit.
+#
+# Best-effort delivery (D6.8): if SQS send fails (transient AWS issue,
+# IAM blip, throttle), log and continue. The user's response is not
+# blocked. The audit for that one click may be lost; CloudWatch retains
+# enough info for manual recovery if needed.
+
+def _publish_audit(*, request_id: str, sub: str, username: str, source: str) -> None:
+    if not SQS_AUDIT_URL:
+        logger.warning(
+            "sqs_audit_url_not_set",
+            extra={"event": "audit_skipped", "reason": "no_url"},
+        )
+        return
+
+    body = json.dumps({
+        "request_id": request_id,
+        "sub":        sub,
+        "username":   username,
+        "clicked_at": datetime.now(timezone.utc).isoformat(),
+        "source":     source,
+    })
+
+    t0 = time.perf_counter()
+    logger.info(
+        "audit_publish_start",
+        extra={"event": "audit_publish_start", "queue_url_set": bool(SQS_AUDIT_URL)},
+    )
+    try:
+        _sqs_client.send_message(QueueUrl=SQS_AUDIT_URL, MessageBody=body)
+        logger.info(
+            "audit_publish_ok",
+            extra={
+                "event":      "audit_publish_ok",
+                "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "audit_publish_failed",
+            extra={
+                "event":         "audit_publish_failed",
+                "error_type":    type(e).__name__,
+                "error_message": str(e),
+                "request_id":    request_id,
+                "elapsed_ms":    int((time.perf_counter() - t0) * 1000),
+            },
+        )
+
+
 def _upsert_visit(sub: str, username: str) -> dict:
     """Increment (or first-create) the user_visits row for this user.
 
@@ -252,6 +323,17 @@ def handler(event, context):
                     "username":      ident["username"],
                 },
             )
+
+        # Stage 6 — async audit log via SQS. Independent of the upsert
+        # result: even if the upsert failed (transient DB blip), the
+        # click event itself happened and is worth recording. Both
+        # operations are best-effort; failures degrade gracefully.
+        _publish_audit(
+            request_id=context.aws_request_id,
+            sub=ident["sub"],
+            username=ident["username"],
+            source=invocation_path,
+        )
 
     response = {
         "greeting": f"hello, {display_name}",

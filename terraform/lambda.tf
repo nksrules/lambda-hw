@@ -81,11 +81,23 @@ resource "aws_lambda_function" "hello" {
   # transparently flips between Proxy endpoint and direct RDS endpoint
   # depending on platform's enable_rds_proxy variable. Lambda code
   # connects to whatever this resolves to without knowing which.
+  #
+  # Stage 6 — SQS_AUDIT_URL is conditional on the platform's SQS VPC
+  # endpoint being available. If the endpoint is disabled, the Lambda
+  # in private subnets has no route to SQS; calling it would hang
+  # until Lambda timeout. We set the env var to empty string in that
+  # case, and the producer code's `if not SQS_AUDIT_URL: return`
+  # short-circuit handles graceful degradation (audit just skips).
   environment {
     variables = {
       DB_ENDPOINT = data.terraform_remote_state.data_platform.outputs.db_endpoint
       DB_NAME     = "lambda_hw"
       DB_USER     = "lambda_hw_app"
+      SQS_AUDIT_URL = (
+        data.terraform_remote_state.data_platform.outputs.sqs_vpc_endpoint_enabled
+        ? aws_sqs_queue.click_audit.url
+        : ""
+      )
     }
   }
 
