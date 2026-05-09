@@ -111,6 +111,18 @@ resource "aws_apigatewayv2_stage" "default" {
   name        = "$default"
   auto_deploy = true
 
+  # Stage 5 D5.1 — route-level throttling at the front door.
+  # Token-bucket: burst is the bucket size, rate is the refill rate.
+  # 10 burst / 5 RPS sustained means a fast-clicking human stays under
+  # but a scripted abuser hits 429 within ~2 seconds. These apply to
+  # every route in the API by virtue of being on default_route_settings;
+  # individual routes can override via aws_apigatewayv2_route's
+  # throttling_burst_limit / throttling_rate_limit (we don't currently).
+  default_route_settings {
+    throttling_burst_limit = 10
+    throttling_rate_limit  = 5
+  }
+
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.api_gateway_access.arn
     format = jsonencode({

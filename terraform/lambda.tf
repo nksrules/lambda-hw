@@ -55,6 +55,15 @@ resource "aws_lambda_function" "hello" {
   timeout     = 10
   memory_size = 256
 
+  # Stage 5 D5.2 — hard cap on simultaneous invocations. Caps blast
+  # radius if traffic spikes (DB connection pool exhaustion, runaway
+  # cost). Existing CloudWatch alarm `${function_name}-throttles` from
+  # Stage 4 will fire if this is hit. Reserved concurrency also removes
+  # capacity from the account-wide unreserved pool (default 1000), so
+  # this directly costs 10 invocations of headroom for any future
+  # unreserved Lambda in this account.
+  reserved_concurrent_executions = 10
+
   # Stage 3 chunk C — VPC config: place the Lambda in the data-platform's
   # private subnets, with both this app's SG and the platform's
   # tenant-db-client marker SG. The marker is the admission ticket; the
